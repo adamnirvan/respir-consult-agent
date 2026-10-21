@@ -1,12 +1,17 @@
 import {
+    ArrowLeft,
     LoaderCircle,
     MessageSquare,
     Mic,
+    RotateCcw,
     SendHorizontal,
     Video,
+    VideoOff,
     X,
 } from 'lucide-react';
 import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { Link } from '@inertiajs/react';
+import { dashboard } from '@/routes';
 import { useEcho } from '@laravel/echo-react';
 import { Button } from '@/components/ui/button';
 import ConsentGate from '@/components/consent-gate';
@@ -42,8 +47,17 @@ type Capture = {
     mime_type?: string;
 } | null;
 
-// Band cutoffs mirror TbClassifier in ai-service (HIGH 0.66, MEDIUM 0.33).
-const RISK_BAND_CUTOFFS = { medium: 0.33, high: 0.66 } as const;
+// Band cutoffs mirror TbClassifier in ai-service (HIGH 0.66, MEDIUM 0.55).
+const RISK_BAND_CUTOFFS = { medium: 0.55, high: 0.66 } as const;
+
+// Upper bound on the cough upload fetch, so a dead network can't block Sage's
+// turn forever — the tool call must always resolve and hand control back.
+const COUGH_UPLOAD_TIMEOUT_MS = 10_000;
+// Last-resort safety net for the tool-call recording wait: covers the 4s
+// capture plus the upload timeout above, with headroom for a MediaRecorder
+// that never fires 'stop' or 'error' at all.
+const COUGH_TOOL_CALL_SAFETY_MS = 16_000;
+const CONTEXT_FETCH_TIMEOUT_MS = 8_000;
 
 const COUGH_CAPTURE_TOOL: LiveTool = {
     functionDeclarations: [
@@ -123,6 +137,207 @@ function StatusPill({
     );
 }
 
+/**
+ * Radial spectrum for Sage's camera tile. Reads real playback frequency
+ * data from `speakerRef` while Sage is speaking (LiveSpeaker.getFrequencyData);
+ * otherwise animates a deterministic idle/thinking hum keyed off the voice
+ * state, so the tile never sits dead-flat between turns.
+ */
+function SageSpectrum({
+    speakerRef,
+    speaking,
+    generating,
+    awaitingSpeech,
+    connecting,
+    connected,
+}: {
+    speakerRef: { current: LiveSpeaker | null };
+    speaking: boolean;
+    generating: boolean;
+    awaitingSpeech: boolean;
+    connecting: boolean;
+    connected: boolean;
+}) {
+    const canvasRef = useRef<HTMLCanvasElement>(null);
+    const stateRef = useRef({
+        speaking,
+        generating,
+        awaitingSpeech,
+        connecting,
+        connected,
+    });
+    stateRef.current = {
+        speaking,
+        generating,
+        awaitingSpeech,
+        connecting,
+        connected,
+    };
+
+    useEffect(() => {
+        const canvas = canvasRef.current;
+        const ctx = canvas?.getContext('2d');
+        if (!canvas || !ctx) return;
+
+        const BAR_COUNT = 64;
+        const bins = new Uint8Array(BAR_COUNT);
+        const magnitudes = new Float32Array(BAR_COUNT);
+        const smoothed = new Float32Array(BAR_COUNT);
+        const startTime = performance.now();
+        let raf = 0;
+
+        // Spreads any single spiky bar into its neighbors so the ring
+        // reads as one continuous wave, not sawtoothed peaks — raw FFT
+        // bins and the procedural noise both spike bar-to-bar otherwise.
+        function smoothCircular(src: Float32Array, out: Float32Array) {
+            for (let pass = 0; pass < 2; pass++) {
+                for (let i = 0; i < BAR_COUNT; i++) {
+                    const prev = src[(i - 1 + BAR_COUNT) % BAR_COUNT];
+                    const next = src[(i + 1) % BAR_COUNT];
+                    out[i] = prev * 0.25 + src[i] * 0.5 + next * 0.25;
+                }
+                src.set(out);
+            }
+        }
+
+        function resize() {
+            const rect = canvas!.getBoundingClientRect();
+            const dpr = window.devicePixelRatio || 1;
+            canvas!.width = Math.max(1, Math.round(rect.width * dpr));
+            canvas!.height = Math.max(1, Math.round(rect.height * dpr));
+        }
+        resize();
+        // Window resize alone misses this: opening/closing the transcript
+        // panel changes the tile's flex width without the window resizing,
+        // so the canvas's backing buffer must track the element itself.
+        const observer = new ResizeObserver(resize);
+        observer.observe(canvas);
+
+        // How "awake" the tile looks per voice state — real audio (below)
+        // overrides this the moment Sage is actually speaking.
+        function energyFor(): number {
+            const s = stateRef.current;
+            if (s.speaking) return 1;
+            if (s.generating) return 0.55;
+            if (s.awaitingSpeech) return 0.4;
+            if (s.connecting) return 0.25;
+            if (s.connected) return 0.18;
+            return 0.08;
+        }
+
+        // Deterministic burst/pause cadence so idle motion reads as
+        // "breathing", not random jitter.
+        function envelope(t: number): number {
+            const burst = Math.max(0, Math.sin(t * 1.7));
+            const shaped = burst * burst;
+            const flutter = 0.5 + 0.5 * Math.sin(t * 13.0);
+            return shaped * (0.35 + 0.65 * flutter);
+        }
+
+        function proceduralBar(i: number, t: number, energy: number): number {
+            const wobble =
+                0.5 +
+                0.5 *
+                    Math.sin(i * 0.37 + t * 2.3) *
+                    Math.sin(i * 0.13 - t * 1.1 + i);
+            const env = energy * (0.3 + 0.7 * envelope(t));
+            return Math.max(0, Math.min(1, env * (0.25 + 0.75 * wobble)));
+        }
+
+        function draw(now: number) {
+            const t = (now - startTime) / 1000;
+            const energy = energyFor();
+            const live =
+                stateRef.current.speaking &&
+                speakerRef.current?.getFrequencyData(bins);
+
+            const w = canvas!.width;
+            const h = canvas!.height;
+            ctx!.clearRect(0, 0, w, h);
+
+            const cx = w / 2;
+            const cy = h / 2;
+            const minDim = Math.min(w, h);
+            const coreBase = minDim * 0.1;
+            const barInner = minDim * 0.16;
+            const barMax = minDim * 0.32;
+            const barW = Math.max(
+                1.5,
+                ((2 * Math.PI * barInner) / BAR_COUNT) * 0.55,
+            );
+
+            let rms = 0;
+
+            for (let i = 0; i < BAR_COUNT; i++) {
+                magnitudes[i] = live
+                    ? bins[i] / 255
+                    : proceduralBar(i, t, energy);
+            }
+            smoothCircular(magnitudes, smoothed);
+
+            for (let i = 0; i < BAR_COUNT; i++) {
+                const magnitude = magnitudes[i];
+                rms += magnitude;
+
+                const angle = (i / BAR_COUNT) * Math.PI * 2 - Math.PI / 2;
+                const len = barInner + magnitude * barMax;
+                const x1 = cx + Math.cos(angle) * barInner;
+                const y1 = cy + Math.sin(angle) * barInner;
+                const x2 = cx + Math.cos(angle) * len;
+                const y2 = cy + Math.sin(angle) * len;
+
+                ctx!.strokeStyle = `rgba(255,255,255,${0.2 + magnitude * 0.65})`;
+                ctx!.lineWidth = barW;
+                ctx!.lineCap = 'round';
+                ctx!.beginPath();
+                ctx!.moveTo(x1, y1);
+                ctx!.lineTo(x2, y2);
+                ctx!.stroke();
+            }
+            rms /= BAR_COUNT;
+
+            const coreR = coreBase + rms * coreBase * 1.6;
+            const glow = ctx!.createRadialGradient(
+                cx,
+                cy,
+                0,
+                cx,
+                cy,
+                coreR * 3,
+            );
+            glow.addColorStop(0, `rgba(255,255,255,${0.3 + rms * 0.35})`);
+            glow.addColorStop(1, 'rgba(255,255,255,0)');
+            ctx!.fillStyle = glow;
+            ctx!.beginPath();
+            ctx!.arc(cx, cy, coreR * 3, 0, Math.PI * 2);
+            ctx!.fill();
+
+            ctx!.fillStyle = '#ffffff';
+            ctx!.beginPath();
+            ctx!.arc(cx, cy, coreR, 0, Math.PI * 2);
+            ctx!.fill();
+
+            raf = requestAnimationFrame(draw);
+        }
+
+        raf = requestAnimationFrame(draw);
+
+        return () => {
+            cancelAnimationFrame(raf);
+            observer.disconnect();
+        };
+    }, [speakerRef]);
+
+    return (
+        <canvas
+            ref={canvasRef}
+            role="img"
+            aria-label="Sage voice activity"
+            className="absolute inset-0 size-full"
+        />
+    );
+}
+
 export default function Consult({
     consultation,
     messages = [],
@@ -163,6 +378,8 @@ export default function Consult({
     );
     const [micLevel, setMicLevel] = useState(0);
     const [quietSample, setQuietSample] = useState(false);
+    const [waveformPeaks, setWaveformPeaks] = useState<number[]>([]);
+    const [resultDismissed, setResultDismissed] = useState(false);
     const [chatOpen, setChatOpen] = useState(true);
     const [unreadCount, setUnreadCount] = useState(0);
 
@@ -198,6 +415,7 @@ export default function Consult({
     const toolCoughRef = useRef(false);
     const coughUploadOkRef = useRef(false);
     const closingRef = useRef(false);
+    const closingInProgressRef = useRef(false);
     const closingTimerRef = useRef<number | null>(null);
     const meterRef = useRef<{
         context: AudioContext;
@@ -213,7 +431,9 @@ export default function Consult({
         cough_analysis?: CoughAnalysis;
     }>(
         `consultation.${consultation.id}`,
-        'cough.analysis',
+        // Leading dot: must match broadcastAs() verbatim. Without it Echo
+        // prepends the App.Events namespace and this handler never fires.
+        '.cough.analysis',
         (payload) => {
             if (payload.cough_analysis) {
                 setAnalysis(payload.cough_analysis);
@@ -268,21 +488,33 @@ export default function Consult({
         [],
     );
 
-    function handleAssistantCue(said: string) {
-        const normalized = said.toLowerCase();
-        const requestsCoughSample = normalized.includes('microphone');
+    /**
+     * Start the cough-capture countdown. Guarded by coughStartedRef so the
+     * explicit start_cough_capture tool signal and the handleAssistantCue
+     * keyword backup can never both fire.
+     */
+    function triggerCoughCapture() {
+        if (coughStartedRef.current) return;
 
-        if (!coughStartedRef.current && requestsCoughSample) {
-            setCoughPhase('prompted');
-            setVoiceHint('Get ready — recording your cough sample next');
-            coughStartedRef.current = true;
-            micRef.current?.stop();
-            micRef.current = null;
-            speakerRef.current?.interrupt();
-            coughTimerRef.current = window.setTimeout(() => {
-                coughTimerRef.current = null;
-                void startCough();
-            }, 900);
+        setCoughPhase('prompted');
+        setVoiceHint('Get ready — recording your cough sample next');
+        coughStartedRef.current = true;
+        micRef.current?.stop();
+        micRef.current = null;
+        speakerRef.current?.interrupt();
+        coughTimerRef.current = window.setTimeout(() => {
+            coughTimerRef.current = null;
+            void startCough();
+        }, 900);
+    }
+
+    // Backup only: the SSE /chat stream now also emits an explicit 'tool'
+    // event when the agent calls start_cough_capture (see send()). This
+    // keyword check just covers the rare case where that event doesn't
+    // decode client-side.
+    function handleAssistantCue(said: string) {
+        if (said.toLowerCase().includes('microphone')) {
+            triggerCoughCapture();
         }
     }
 
@@ -296,6 +528,8 @@ export default function Consult({
         setAnalysis(null);
         setCoughRisk(null);
         setCoughPhase('idle');
+        setWaveformPeaks([]);
+        setResultDismissed(false);
         coughStartedRef.current = false;
         if (coughTimerRef.current !== null) {
             window.clearTimeout(coughTimerRef.current);
@@ -356,6 +590,7 @@ export default function Consult({
     async function startVoiceConsult() {
         resetCoughAssessment();
         closingRef.current = false;
+        closingInProgressRef.current = false;
         toolCoughRef.current = false;
         coughUploadOkRef.current = false;
         if (closingTimerRef.current !== null) {
@@ -541,6 +776,16 @@ export default function Consult({
         clearLiveTranscript();
     }
 
+    /**
+     * Leaving for the dashboard mid-visit: persist the transcript, then
+     * release mic, speaker, and socket so nothing keeps running behind
+     * the dashboard.
+     */
+    function leaveToDashboard(): void {
+        void saveSessionLog(true);
+        teardownLiveSession();
+    }
+
     async function send(text: string) {
         if (!text.trim() || streaming) return;
 
@@ -605,6 +850,12 @@ export default function Consult({
                             };
                             return copy;
                         });
+                    }
+                    if (
+                        event.type === 'tool' &&
+                        event.name === 'start_cough_capture'
+                    ) {
+                        triggerCoughCapture();
                     }
                     if (event.type === 'done') {
                         setStreaming(false);
@@ -719,8 +970,13 @@ export default function Consult({
             stream = await navigator.mediaDevices.getUserMedia({
                 audio: {
                     channelCount: 1,
-                    echoCancellation: true,
-                    noiseSuppression: true,
+                    // Raw capture: browser noise suppression, AGC, and echo
+                    // cancellation treat cough bursts as noise and destroy
+                    // them irreversibly. Burst isolation and any denoising
+                    // happen downstream in the AI service instead.
+                    echoCancellation: false,
+                    noiseSuppression: false,
+                    autoGainControl: false,
                 },
             });
         } catch (error) {
@@ -773,6 +1029,7 @@ export default function Consult({
             setQuietSample(peak < 0.02);
             setCoughPhase('processing');
             setVoiceHint('Sample received — analysing securely');
+            void computeWaveformPeaks(blob);
             await analyzeCough(blob);
         };
 
@@ -788,6 +1045,56 @@ export default function Consult({
         }, 4000);
     }
 
+    /**
+     * Best-effort waveform preview of the recorded sample for the result
+     * card. Visualization only — failures leave the card without a
+     * waveform instead of breaking the flow.
+     */
+    async function computeWaveformPeaks(blob: Blob): Promise<void> {
+        try {
+            const Context =
+                window.AudioContext ??
+                (
+                    window as unknown as {
+                        webkitAudioContext?: typeof AudioContext;
+                    }
+                ).webkitAudioContext;
+
+            if (!Context) {
+                return;
+            }
+
+            const context = new Context();
+            const buffer = await context.decodeAudioData(
+                await blob.arrayBuffer(),
+            );
+            const data = buffer.getChannelData(0);
+            const buckets = 64;
+            const step = Math.max(1, Math.floor(data.length / buckets));
+            const peaks: number[] = [];
+
+            for (let i = 0; i < data.length; i += step) {
+                let max = 0;
+                const end = Math.min(data.length, i + step);
+
+                for (let j = i; j < end; j += 4) {
+                    const value = Math.abs(data[j]);
+
+                    if (value > max) {
+                        max = value;
+                    }
+                }
+
+                peaks.push(Math.min(1, max));
+            }
+
+            setWaveformPeaks(peaks);
+            await context.close().catch(() => undefined);
+        } catch (error) {
+            console.error('Could not build waveform preview', error);
+        }
+    }
+
     async function analyzeCough(blob: Blob): Promise<void> {
         try {
             const formData = new FormData();
@@ -801,6 +1108,7 @@ export default function Consult({
                         'X-Requested-With': 'XMLHttpRequest',
                     },
                     body: formData,
+                    signal: AbortSignal.timeout(COUGH_UPLOAD_TIMEOUT_MS),
                 },
             );
 
@@ -866,11 +1174,35 @@ export default function Consult({
 
         if (recorder) {
             await new Promise<void>((resolve) => {
-                const original = recorder.onstop;
-                recorder.onstop = (event) => {
-                    original?.call(recorder, event);
+                let settled = false;
+                const finish = () => {
+                    if (settled) return;
+                    settled = true;
                     resolve();
                 };
+
+                // onstop's handler (set in startCough) awaits analyzeCough's
+                // upload — wait for that promise too, not just the event,
+                // otherwise coughUploadOkRef below reads stale before the
+                // upload has actually finished.
+                const originalStop = recorder.onstop;
+                recorder.onstop = async (event) => {
+                    try {
+                        await originalStop?.call(recorder, event);
+                    } finally {
+                        finish();
+                    }
+                };
+
+                // A recorder error never fires 'stop', so without this the
+                // tool call — and Sage's turn — would hang forever.
+                const originalError = recorder.onerror;
+                recorder.onerror = (event) => {
+                    originalError?.call(recorder, event);
+                    finish();
+                };
+
+                window.setTimeout(finish, COUGH_TOOL_CALL_SAFETY_MS);
             });
         }
 
@@ -915,7 +1247,8 @@ export default function Consult({
 
     async function beginGracefulClose(): Promise<void> {
         const live = liveRef.current;
-        if (!live) return;
+        if (!live || closingInProgressRef.current) return;
+        closingInProgressRef.current = true;
 
         if (closingTimerRef.current !== null) {
             window.clearTimeout(closingTimerRef.current);
@@ -952,7 +1285,10 @@ export default function Consult({
                     consultation.id,
                     { query: { q: query } },
                 ),
-                { headers: { 'X-Requested-With': 'XMLHttpRequest' } },
+                {
+                    headers: { 'X-Requested-With': 'XMLHttpRequest' },
+                    signal: AbortSignal.timeout(CONTEXT_FETCH_TIMEOUT_MS),
+                },
             );
 
             if (!response.ok) {
@@ -996,11 +1332,12 @@ export default function Consult({
     const awaitingCough = coughPhase === 'prompted';
     const recordingCough = coughPhase === 'recording';
     const analysisPending = coughPhase === 'processing';
+    const coughBusy = coughPhase === 'recording' || coughPhase === 'processing';
     const showingPreviousAssessment =
         !sessionStarted && Boolean(consultation.cough_analysis);
 
     return (
-        <div className="relative h-dvh w-full overflow-hidden bg-black text-white">
+        <div className="relative flex h-dvh w-full flex-col overflow-hidden bg-black text-white sm:flex-row">
             {consentOpen && (
                 <ConsentGate
                     consultationId={consultation.id}
@@ -1012,411 +1349,214 @@ export default function Consult({
                 />
             )}
 
-            <video
-                ref={videoRef}
-                autoPlay
-                muted
-                playsInline
-                className="absolute inset-0 size-full object-cover"
-            />
-
-            <div className="pointer-events-none absolute inset-0 bg-black/20" />
-
-            <div className="absolute inset-x-0 top-0 z-10 flex items-start justify-between gap-4 p-4 sm:p-5">
-                <div className="flex items-center gap-2.5">
-                    <span className="flex size-8 items-center justify-center rounded-[14px] bg-white text-xs font-bold text-black">
-                        S
-                    </span>
-                    <div className="flex flex-col">
-                        <span className="text-sm font-semibold">Respair</span>
-                        <span className="font-mono text-[10px] leading-tight tracking-widest text-[#71717A] uppercase">
-                            pre-visit · voice consult
-                        </span>
-                    </div>
-                </div>
-
-                <div className="flex flex-wrap items-center justify-end gap-2">
-                    {connecting && <StatusPill pulse>connecting</StatusPill>}
-                    {awaitingSpeech && (
-                        <StatusPill pulse>sage is ready</StatusPill>
-                    )}
-                    {speaking && <StatusPill pulse>talking</StatusPill>}
-                    {generating && <StatusPill>generating</StatusPill>}
-                    {connected &&
-                        !speaking &&
-                        !generating &&
-                        !connecting &&
-                        !awaitingSpeech && (
-                            <StatusPill pulse>listening</StatusPill>
-                        )}
-                    <StatusPill>
-                        {cameraOn ? 'camera live' : 'camera off'}
-                    </StatusPill>
-                </div>
-            </div>
-
-            {awaitingCough && !recordingCough && (
-                <div className="absolute inset-0 z-10 flex items-center justify-center bg-black/25">
-                    <div className="flex flex-col items-center gap-4 text-center">
-                        <div className="relative flex size-28 items-center justify-center rounded-full border border-white/25 bg-white/5">
-                            <span className="absolute inset-0 animate-ping rounded-full border border-white/30" />
-                            <Mic className="size-10 text-[#94A3B8]" />
-                        </div>
-                        <div>
-                            <p className="font-mono text-[10px] tracking-widest text-[#A1A1AA] uppercase">
-                                get ready
-                            </p>
-                            <p className="mt-1 text-lg font-semibold">
-                                Cough sample coming next
-                            </p>
-                            <p className="mt-1 text-sm text-[#A1A1AA]">
-                                Recording starts automatically — no need to
-                                press anything.
-                            </p>
-                        </div>
-                    </div>
-                </div>
-            )}
-
-            {recordingCough && (
-                <div className="absolute inset-0 z-10 flex items-center justify-center bg-black/25">
-                    <div className="flex flex-col items-center gap-4 text-center">
-                        <div className="relative flex size-28 items-center justify-center rounded-full border border-white/50 bg-white/10">
-                            <span className="absolute inset-0 animate-ping rounded-full border border-white/40" />
-                            <span className="absolute inset-2 animate-pulse rounded-full bg-white/10" />
-                            <Mic className="relative size-10 animate-pulse text-white" />
-                        </div>
-                        <div>
-                            <p className="font-mono text-[10px] tracking-widest text-[#94A3B8] uppercase">
-                                recording
-                            </p>
-                            <p className="mt-1 text-lg font-semibold">
-                                Cough twice toward the microphone
-                            </p>
-                            <div
-                                role="meter"
-                                aria-label="Microphone input level"
-                                aria-valuemin={0}
-                                aria-valuemax={100}
-                                aria-valuenow={Math.round(micLevel * 100)}
-                                className="mx-auto mt-3 h-1 w-3/4 max-w-56 overflow-hidden rounded-full bg-white/10"
-                            >
-                                <div
-                                    className="h-full rounded-full bg-white/70 transition-[width] duration-150"
-                                    style={{
-                                        width: `${Math.min(100, Math.round(micLevel * 100))}%`,
-                                    }}
-                                />
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            )}
-
-            {analysisPending && (
-                <div className="absolute inset-0 z-10 flex items-center justify-center bg-black/25">
-                    <div className="flex items-center gap-2 rounded-[14px] border border-white/10 bg-[#0B0B0D]/90 px-4 py-3">
-                        <LoaderCircle className="size-4 animate-spin text-[#94A3B8]" />
-                        <span className="font-mono text-[10px] tracking-widest text-[#A1A1AA] uppercase">
-                            analysing sample securely
-                        </span>
-                    </div>
-                </div>
-            )}
-
-            {!sessionStarted && !connecting && !awaitingSpeech && (
-                <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-5 bg-black/55 px-4 backdrop-blur-sm">
-                    <div className="flex items-center gap-2.5">
-                        <span className="flex size-10 items-center justify-center rounded-[14px] bg-white text-sm font-bold text-black">
-                            S
-                        </span>
-                        <div className="flex flex-col">
-                            <span className="text-base font-semibold">
-                                Respair
-                            </span>
-                            <span className="font-mono text-[10px] tracking-widest text-[#71717A] uppercase">
-                                pre-visit consult
-                            </span>
-                        </div>
-                    </div>
-                    <p className="max-w-sm text-center text-sm text-[#A1A1AA]">
-                        Sage, your voice assistant, will greet you live — like a
-                        real conversation. The camera fills this screen and the
-                        transcript lives in the chat panel.
-                    </p>
-                    {showingPreviousAssessment && (
-                        <p className="font-mono text-[10px] tracking-widest text-[#71717A] uppercase">
-                            previous cough screening on file
-                        </p>
-                    )}
-                    <div className="flex flex-col items-center gap-3">
-                        <Button
-                            className="rounded-[14px] bg-white px-6 font-semibold text-black hover:bg-[#CBD5E1]"
-                            size="lg"
-                            onClick={() => {
-                                if (consented) {
-                                    void startVoiceConsult();
-                                } else {
-                                    setConsentOpen(true);
-                                }
-                            }}
-                        >
-                            <Mic className="size-5" />
-                            Start voice consult
-                        </Button>
-                        <Button
-                            variant="ghost"
-                            className="rounded-[14px] border border-white/15 bg-black/30 font-semibold text-white hover:bg-white/10"
-                            size="sm"
-                            onClick={toggleCamera}
-                        >
-                            <Video className="size-4" />
-                            {cameraOn
-                                ? 'Camera on — tap to stop'
-                                : 'Start camera'}
-                        </Button>
-                    </div>
-                </div>
-            )}
-
-            {(sessionStarted || connecting || awaitingSpeech) && (
-                <div className="absolute inset-x-0 bottom-0 z-10 flex flex-col items-center gap-3 p-4 sm:p-5">
-                    {sessionStarted && voiceHint && (
-                        <span className="rounded-full border border-white/10 bg-black/40 px-4 py-1.5 font-mono text-[10px] tracking-widest text-[#A1A1AA] uppercase backdrop-blur">
-                            {voiceHint}
-                        </span>
-                    )}
-
-                    <div className="flex items-center gap-2">
-                        <Button
-                            variant="ghost"
-                            size="icon"
-                            aria-label={
-                                cameraOn ? 'Stop camera' : 'Start camera'
-                            }
-                            onClick={toggleCamera}
-                            className={cn(
-                                'rounded-full border border-white/10 bg-black/40 text-white backdrop-blur hover:bg-white/10',
-                                cameraOn &&
-                                    'bg-white text-black hover:bg-[#CBD5E1]',
-                            )}
-                        >
-                            <Video className="size-5" />
-                        </Button>
-
-                        {cameraOn && (
-                            <Button
-                                variant="ghost"
-                                size="sm"
-                                onClick={() => void capturePhoto()}
-                                className="rounded-full border border-white/10 bg-black/40 text-white backdrop-blur hover:bg-white/10"
-                            >
-                                Save photo
-                            </Button>
-                        )}
-
-                        <Button
-                            variant="ghost"
-                            size="icon"
-                            aria-label="Open chat"
-                            onClick={() => {
-                                setChatOpen(true);
-                                setUnreadCount(0);
-                            }}
-                            className="relative rounded-full border border-white/10 bg-black/40 text-white backdrop-blur hover:bg-white/10"
-                        >
-                            <MessageSquare className="size-5" />
-                            {unreadCount > 0 && (
-                                <span className="absolute -top-1 -right-1 flex size-5 items-center justify-center rounded-full bg-white text-[10px] font-bold text-black">
-                                    {unreadCount}
-                                </span>
-                            )}
-                        </Button>
-                    </div>
-
-                    {captures.length > 0 && (
-                        <p className="font-mono text-[10px] tracking-widest text-[#71717A] uppercase">
-                            {captures.length} capture
-                            {captures.length === 1 ? '' : 's'} saved for the
-                            doctor
-                        </p>
-                    )}
-                </div>
-            )}
-
-            {(sessionStarted || connecting || awaitingSpeech) && chatOpen && (
-                <aside className="animate-panel-in absolute top-4 right-4 bottom-4 z-30 flex w-[24rem] max-w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-[14px] border border-white/10 bg-[#0B0B0D]/95 shadow-2xl backdrop-blur">
-                    <div className="flex items-center justify-between border-b border-white/10 px-5 py-4">
-                        <div className="flex flex-col">
-                            <h2 className="text-sm font-semibold">
-                                Transcript
-                            </h2>
-                            <span className="font-mono text-[10px] tracking-widest text-[#71717A] uppercase">
-                                {connecting
-                                    ? 'Connecting to Sage…'
-                                    : awaitingSpeech
-                                      ? 'Sage is about to speak…'
-                                      : speaking
-                                        ? 'Sage is speaking — talk over it to interrupt'
-                                        : generating
-                                          ? 'Generating reply…'
-                                          : connected
-                                            ? 'Listening — turn-taking is automatic'
-                                            : useFallbackLoop
-                                              ? 'Turn-based voice — speak or type to reply'
-                                              : 'Idle'}
-                            </span>
-                        </div>
-                        <Button
-                            variant="ghost"
-                            size="icon"
-                            aria-label="Close chat"
-                            onClick={() => {
-                                setChatOpen(false);
-                                setUnreadCount(0);
-                            }}
-                            className="rounded-[14px] text-[#A1A1AA] hover:bg-white/10 hover:text-white"
-                        >
-                            <X className="size-5" />
-                        </Button>
-                    </div>
-
-                    <div
-                        ref={chatRef}
-                        className="flex flex-1 flex-col gap-2 overflow-y-auto px-5 py-4"
-                    >
-                        {chat.length === 0 && !assistantLive && !userLive && (
-                            <p className="text-sm text-[#71717A]">
-                                The conversation appears here, word by word as
-                                it is spoken.
-                            </p>
-                        )}
-                        {chat.map((msg, i) => (
-                            <div
-                                key={i}
-                                className={
-                                    msg.role === 'user'
-                                        ? 'max-w-[85%] self-end rounded-[14px] bg-white px-3 py-2 text-sm text-black'
-                                        : 'max-w-[85%] self-start rounded-[14px] border border-white/10 bg-white/5 px-3 py-2 text-sm text-white'
-                                }
-                            >
-                                {msg.content}
-                            </div>
-                        ))}
-                        {userLive && (
-                            <div className="max-w-[85%] self-end rounded-[14px] border border-white/20 bg-white/10 px-3 py-2 text-sm text-white italic">
-                                {userLive}
-                            </div>
-                        )}
-                        {speaking && (
-                            <div className="flex items-center gap-1 self-start px-2 py-1">
-                                <span className="size-2 animate-bounce rounded-full bg-white/60" />
-                                <span className="animate-bounce-1 size-2 rounded-full bg-white/60" />
-                                <span className="animate-bounce-2 size-2 rounded-full bg-white/60" />
-                            </div>
-                        )}
-                        {assistantLive && (
-                            <div className="max-w-[85%] self-start rounded-[14px] border border-white/10 bg-white/5 px-3 py-2 text-sm text-white">
-                                {assistantLive}
-                            </div>
-                        )}
-                    </div>
-
-                    <form
-                        onSubmit={(e: React.FormEvent<HTMLFormElement>) => {
-                            e.preventDefault();
-                            void send(message);
-                            setMessage('');
-                        }}
-                        className="flex gap-2 border-t border-white/10 p-4"
-                    >
-                        <textarea
-                            value={message}
-                            onChange={(
-                                e: React.ChangeEvent<HTMLTextAreaElement>,
-                            ) => setMessage(e.target.value)}
-                            placeholder="Type here — replies stream the same way…"
-                            disabled={streaming}
-                            className="flex-1 resize-none rounded-[14px] border border-white/10 bg-white/5 px-3 py-2 text-sm text-white shadow-none outline-none placeholder:text-[#71717A] focus-visible:border-white/30 focus-visible:ring-[3px] focus-visible:ring-white/20 disabled:cursor-not-allowed disabled:opacity-50"
-                            rows={2}
+            <div className="relative min-h-0 flex-1 overflow-hidden">
+                <div className="absolute inset-0 grid grid-cols-1 gap-2 p-2 sm:grid-cols-2 sm:gap-3 sm:p-3">
+                    <div className="relative overflow-hidden rounded-[18px] bg-[#111114]">
+                        <video
+                            ref={videoRef}
+                            autoPlay
+                            muted
+                            playsInline
+                            className="absolute inset-0 size-full object-cover"
                         />
-                        <Button
-                            type="submit"
-                            size="icon"
-                            className="self-end rounded-[14px] bg-white text-black hover:bg-[#CBD5E1]"
-                            disabled={streaming || !message.trim()}
-                            aria-label="Send message"
-                        >
-                            <SendHorizontal className="size-4" />
-                        </Button>
-                    </form>
-
-                    <div className="border-t border-white/10 px-5 py-4">
-                        <div className="mb-3 flex items-center justify-between">
-                            <div className="flex flex-col">
-                                <h3 className="text-sm font-semibold">
-                                    Cough sample
-                                </h3>
-                                <span className="font-mono text-[10px] tracking-widest text-[#71717A] uppercase">
-                                    TB acoustic screen
-                                </span>
+                        {!cameraOn && (
+                            <div className="absolute inset-0 flex items-center justify-center">
+                                <div className="flex size-16 items-center justify-center rounded-full border border-white/15 bg-white/5">
+                                    <VideoOff className="size-6 text-[#71717A]" />
+                                </div>
                             </div>
-                            {analysisPending && (
-                                <StatusPill>analysing</StatusPill>
-                            )}
-                            {coughPhase === 'error' && (
-                                <StatusPill>retry needed</StatusPill>
-                            )}
-                            {coughRisk &&
-                                !analysisPending &&
-                                coughPhase !== 'error' && (
-                                    <StatusPill>{coughRisk} risk</StatusPill>
-                                )}
-                        </div>
-
-                        {showingPreviousAssessment && analysis && (
-                            <p className="mb-3 text-xs text-[#71717A]">
-                                Previous session result. Start a new consult to
-                                record a fresh sample.
-                            </p>
                         )}
+                        <span className="absolute bottom-3 left-3 rounded-full bg-black/50 px-2.5 py-1 font-mono text-[10px] tracking-widest text-[#E4E4E7] uppercase backdrop-blur">
+                            You
+                        </span>
+                    </div>
 
-                        <Button
-                            className="w-full rounded-[14px] bg-white font-semibold text-black hover:bg-[#CBD5E1]"
-                            onClick={() => void startCough()}
-                            disabled={
-                                recordingCough ||
-                                awaitingCough ||
-                                analysisPending
-                            }
+                    <div className="relative overflow-hidden rounded-[18px] border border-white/10 bg-[#111114]">
+                        <SageSpectrum
+                            speakerRef={speakerRef}
+                            speaking={speaking}
+                            generating={generating}
+                            awaitingSpeech={awaitingSpeech}
+                            connecting={connecting}
+                            connected={connected}
+                        />
+                        <span className="absolute bottom-3 left-3 rounded-full bg-black/50 px-2.5 py-1 font-mono text-[10px] tracking-widest text-[#E4E4E7] uppercase backdrop-blur">
+                            Sage
+                        </span>
+                    </div>
+                </div>
+
+                <div className="pointer-events-none absolute inset-0 bg-black/20" />
+
+                <div className="absolute inset-x-0 top-0 z-10 flex items-start justify-between gap-4 p-4 sm:p-5">
+                    <div className="flex items-center gap-2">
+                        <Link
+                            href={dashboard().url}
+                            onClick={leaveToDashboard}
+                            aria-label="Back to dashboard"
+                            className="flex size-8 items-center justify-center rounded-full border border-white/10 bg-black/40 text-white backdrop-blur transition-all duration-200 hover:scale-105 hover:bg-white/10 active:scale-95"
                         >
-                            <Mic
-                                className={
-                                    recordingCough
-                                        ? 'size-4 animate-pulse'
-                                        : 'size-4'
-                                }
+                            <ArrowLeft className="size-4" />
+                        </Link>
+                        <div className="flex items-center gap-2.5 rounded-full border border-white/10 bg-black/40 py-1.5 pr-3 pl-2.5 backdrop-blur">
+                            <img
+                                src="/Respir logo.png"
+                                alt="Respir"
+                                className="h-4 w-auto"
                             />
-                            {recordingCough
-                                ? 'Recording…'
-                                : analysisPending
-                                  ? 'Analysing…'
-                                  : coughPhase === 'error'
-                                    ? 'Try Again'
-                                    : coughPhase === 'complete'
-                                      ? 'Record New Sample'
-                                      : 'Record Cough'}
-                        </Button>
+                            <span className="h-3 w-px bg-white/15" />
+                            <span className="font-mono text-[10px] leading-tight tracking-widest text-[#71717A] uppercase">
+                                pre-visit · voice consult
+                            </span>
+                        </div>
+                    </div>
 
-                        {quietSample && !recordingCough && (
-                            <p className="mt-2 text-xs text-[#A1A1AA]">
-                                That sample was very quiet — move closer to the
-                                microphone and try again.
-                            </p>
+                    <div className="flex flex-wrap items-center justify-end gap-2">
+                        {connecting && (
+                            <StatusPill pulse>connecting</StatusPill>
                         )}
+                        {awaitingSpeech && (
+                            <StatusPill pulse>sage is ready</StatusPill>
+                        )}
+                        {speaking && <StatusPill pulse>talking</StatusPill>}
+                        {generating && <StatusPill>generating</StatusPill>}
+                        {connected &&
+                            !speaking &&
+                            !generating &&
+                            !connecting &&
+                            !awaitingSpeech && (
+                                <StatusPill pulse>listening</StatusPill>
+                            )}
+                        <StatusPill>
+                            {cameraOn ? 'camera live' : 'camera off'}
+                        </StatusPill>
+                    </div>
+                </div>
 
-                        {analysis && !analysisPending && (
-                            <div className="mt-4 space-y-3 text-sm text-[#E4E4E7]">
+                {awaitingCough && !recordingCough && (
+                    <div className="absolute inset-0 z-10 flex items-center justify-center bg-black/25">
+                        <div className="flex flex-col items-center gap-4 text-center">
+                            <div className="relative flex size-28 items-center justify-center rounded-full border border-white/25 bg-white/5">
+                                <span className="absolute inset-0 animate-ping rounded-full border border-white/30" />
+                                <Mic className="size-10 text-[#94A3B8]" />
+                            </div>
+                            <div>
+                                <p className="font-mono text-[10px] tracking-widest text-[#A1A1AA] uppercase">
+                                    get ready
+                                </p>
+                                <p className="mt-1 text-lg font-semibold">
+                                    Cough sample coming next
+                                </p>
+                                <p className="mt-1 text-sm text-[#A1A1AA]">
+                                    Recording starts automatically — no need to
+                                    press anything.
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {recordingCough && (
+                    <div className="absolute inset-0 z-10 flex items-center justify-center bg-black/25">
+                        <div className="flex flex-col items-center gap-4 text-center">
+                            <div className="relative flex size-28 items-center justify-center rounded-full border border-white/50 bg-white/10">
+                                <span className="absolute inset-0 animate-ping rounded-full border border-white/40" />
+                                <span className="absolute inset-2 animate-pulse rounded-full bg-white/10" />
+                                <Mic className="relative size-10 animate-pulse text-white" />
+                            </div>
+                            <div>
+                                <p className="font-mono text-[10px] tracking-widest text-[#94A3B8] uppercase">
+                                    recording
+                                </p>
+                                <p className="mt-1 text-lg font-semibold">
+                                    Cough twice toward the microphone
+                                </p>
+                                <div
+                                    role="meter"
+                                    aria-label="Microphone input level"
+                                    aria-valuemin={0}
+                                    aria-valuemax={100}
+                                    aria-valuenow={Math.round(micLevel * 100)}
+                                    className="mx-auto mt-3 h-1 w-3/4 max-w-56 overflow-hidden rounded-full bg-white/10"
+                                >
+                                    <div
+                                        className="h-full rounded-full bg-white/70 transition-[width] duration-150"
+                                        style={{
+                                            width: `${Math.min(100, Math.round(micLevel * 100))}%`,
+                                        }}
+                                    />
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {analysisPending && (
+                    <div className="absolute inset-0 z-10 flex items-center justify-center bg-black/25">
+                        <div className="flex items-center gap-2 rounded-[14px] border border-white/10 bg-[#0B0B0D]/90 px-4 py-3">
+                            <LoaderCircle className="size-4 animate-spin text-[#94A3B8]" />
+                            <span className="font-mono text-[10px] tracking-widest text-[#A1A1AA] uppercase">
+                                analysing sample securely
+                            </span>
+                        </div>
+                    </div>
+                )}
+
+                {analysis && !analysisPending && !resultDismissed && (
+                    <div className="absolute inset-0 z-20 flex items-center justify-center overflow-y-auto bg-black/55 px-4 py-8 backdrop-blur-sm">
+                        <div className="animate-panel-in w-full max-w-md rounded-[14px] border border-white/10 bg-[#0B0B0D] p-5 shadow-2xl sm:p-6">
+                            <div className="flex items-start justify-between gap-3">
+                                <div>
+                                    <p className="font-mono text-[10px] tracking-widest text-[#94A3B8] uppercase">
+                                        Cough result
+                                    </p>
+                                    <h2 className="mt-1 text-lg font-semibold text-white">
+                                        {coughRisk ? (
+                                            <span className="capitalize">
+                                                {coughRisk} risk
+                                            </span>
+                                        ) : (
+                                            'Sample analysed'
+                                        )}
+                                    </h2>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                    {coughRisk && (
+                                        <StatusPill>
+                                            {coughRisk} risk
+                                        </StatusPill>
+                                    )}
+                                    <Button
+                                        variant="ghost"
+                                        size="icon"
+                                        aria-label="Dismiss result"
+                                        onClick={() => setResultDismissed(true)}
+                                        className="rounded-[14px] text-[#A1A1AA] hover:bg-white/10 hover:text-white"
+                                    >
+                                        <X className="size-5" />
+                                    </Button>
+                                </div>
+                            </div>
+
+                            {waveformPeaks.length > 0 && (
+                                <div
+                                    className="mt-4 flex h-16 items-end gap-[3px]"
+                                    role="img"
+                                    aria-label="Recorded cough waveform"
+                                >
+                                    {waveformPeaks.map((peak, index) => (
+                                        <div
+                                            key={index}
+                                            className="flex-1 rounded-full bg-white/40"
+                                            style={{
+                                                height: `${Math.max(6, Math.round(peak * 100))}%`,
+                                            }}
+                                        />
+                                    ))}
+                                </div>
+                            )}
+
+                            <div className="mt-4 flex flex-col gap-2.5 text-sm text-[#E4E4E7]">
                                 {typeof analysis.risk_score === 'number' &&
                                     analysis.risk_level !== 'unclear' && (
                                         <div>
@@ -1476,18 +1616,22 @@ export default function Consult({
                                             {RISK_MEANINGS[analysis.risk_level]}
                                         </p>
                                     )}
-                                <p>
-                                    <span className="font-medium">
-                                        Findings:
-                                    </span>{' '}
-                                    {analysis.findings}
-                                </p>
-                                <p>
-                                    <span className="font-medium">
-                                        Recommendation:
-                                    </span>{' '}
-                                    {analysis.recommendation}
-                                </p>
+                                {analysis.findings && (
+                                    <p>
+                                        <span className="font-medium">
+                                            Findings:{' '}
+                                        </span>
+                                        {analysis.findings}
+                                    </p>
+                                )}
+                                {analysis.recommendation && (
+                                    <p>
+                                        <span className="font-medium">
+                                            Recommendation:{' '}
+                                        </span>
+                                        {analysis.recommendation}
+                                    </p>
+                                )}
                                 {typeof analysis.duration_s === 'number' &&
                                     analysis.duration_s > 0 && (
                                         <p className="text-xs text-[#71717A]">
@@ -1496,51 +1640,257 @@ export default function Consult({
                                             seconds.
                                         </p>
                                     )}
-                                {analysis.model?.available === false && (
-                                    <p className="text-xs text-[#71717A]">
-                                        Limited result — the analysis model was
-                                        offline when this sample was processed.
-                                    </p>
-                                )}
-                                {(analysis.risk_level === 'low' ||
-                                    analysis.risk_level === 'medium' ||
-                                    analysis.risk_level === 'high') && (
-                                    <div>
-                                        <p className="font-medium">
-                                            What happens next:
-                                        </p>
-                                        <ol className="ml-5 list-decimal space-y-1">
-                                            <li>
-                                                Your doctor reviews this result
-                                                together with your interview
-                                                notes.
-                                            </li>
-                                            <li>
-                                                You will still be examined in
-                                                person — this result guides that
-                                                exam, it does not replace it.
-                                            </li>
-                                            <li>
-                                                Mention any new symptoms at your
-                                                visit, such as fever, night
-                                                sweats, or weight loss.
-                                            </li>
-                                        </ol>
-                                    </div>
-                                )}
-                                {analysis.risk_level === 'unclear' && (
-                                    <p>
-                                        Tap Record Cough below to try again with
-                                        a clearer sample.
-                                    </p>
-                                )}
                                 <p className="text-xs text-[#71717A] italic">
                                     This is not a diagnosis. Please see a doctor
                                     for a clinical assessment.
                                 </p>
                             </div>
+
+                            <div className="mt-5 flex flex-col gap-2 sm:flex-row">
+                                <Button
+                                    onClick={() => {
+                                        resetCoughAssessment();
+                                        void startCough();
+                                    }}
+                                    disabled={coughBusy}
+                                    className="flex-1 rounded-[14px] bg-white font-semibold text-black hover:bg-[#CBD5E1]"
+                                >
+                                    <RotateCcw className="size-4" />
+                                    Record again
+                                </Button>
+                                <Link
+                                    href={dashboard().url}
+                                    onClick={leaveToDashboard}
+                                    className="inline-flex flex-1 items-center justify-center gap-2 rounded-[14px] border border-white/15 bg-transparent px-4 py-2 text-sm font-semibold text-white hover:bg-white/10"
+                                >
+                                    <ArrowLeft className="size-4" />
+                                    Back to dashboard
+                                </Link>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {!sessionStarted && !connecting && !awaitingSpeech && (
+                    <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-5 bg-black/55 px-4 backdrop-blur-sm">
+                        <div className="flex flex-col items-center gap-2">
+                            <img
+                                src="/Respir logo.png"
+                                alt="Respir"
+                                className="h-7 w-auto"
+                            />
+                            <span className="font-mono text-[10px] tracking-widest text-[#71717A] uppercase">
+                                pre-visit consult
+                            </span>
+                        </div>
+                        <p className="max-w-sm text-center text-sm text-[#A1A1AA]">
+                            Sage, your voice assistant, will greet you live —
+                            like a real conversation. Your camera sits beside
+                            Sage's voice, and the transcript lives in the chat
+                            panel.
+                        </p>
+                        {showingPreviousAssessment && (
+                            <p className="font-mono text-[10px] tracking-widest text-[#71717A] uppercase">
+                                previous cough screening on file
+                            </p>
+                        )}
+                        <Button
+                            className="rounded-[14px] bg-white px-6 font-semibold text-black transition-all duration-200 hover:scale-105 hover:bg-[#CBD5E1] active:scale-95"
+                            size="lg"
+                            onClick={() => {
+                                if (consented) {
+                                    void startVoiceConsult();
+                                } else {
+                                    setConsentOpen(true);
+                                }
+                            }}
+                        >
+                            <Mic className="size-5" />
+                            Start session
+                        </Button>
+                        <Link
+                            href={dashboard().url}
+                            className="inline-flex items-center gap-1.5 font-mono text-[10px] tracking-widest text-[#71717A] uppercase underline-offset-4 transition-colors hover:text-white hover:underline"
+                        >
+                            <ArrowLeft className="size-3.5" />
+                            Back to dashboard
+                        </Link>
+                    </div>
+                )}
+
+                {(sessionStarted || connecting || awaitingSpeech) && (
+                    <div className="absolute inset-x-0 bottom-0 z-10 flex flex-col items-center gap-3 p-4 sm:p-5">
+                        {sessionStarted && voiceHint && (
+                            <span className="rounded-full border border-white/10 bg-black/40 px-4 py-1.5 font-mono text-[10px] tracking-widest text-[#A1A1AA] uppercase backdrop-blur">
+                                {voiceHint}
+                            </span>
+                        )}
+
+                        <div className="flex items-center gap-2">
+                            <Button
+                                variant="ghost"
+                                size="icon"
+                                aria-label={
+                                    cameraOn ? 'Stop camera' : 'Start camera'
+                                }
+                                onClick={toggleCamera}
+                                className={cn(
+                                    'rounded-full border border-white/10 bg-black/40 text-white backdrop-blur transition-all duration-200 hover:scale-105 hover:bg-white/10 active:scale-95',
+                                    cameraOn &&
+                                        'bg-white text-black hover:bg-[#CBD5E1]',
+                                )}
+                            >
+                                <Video className="size-5" />
+                            </Button>
+
+                            {cameraOn && (
+                                <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    onClick={() => void capturePhoto()}
+                                    className="rounded-full border border-white/10 bg-black/40 text-white backdrop-blur transition-all duration-200 hover:scale-105 hover:bg-white/10 active:scale-95"
+                                >
+                                    Save photo
+                                </Button>
+                            )}
+
+                            <Button
+                                variant="ghost"
+                                size="icon"
+                                aria-label="Open chat"
+                                onClick={() => {
+                                    setChatOpen(true);
+                                    setUnreadCount(0);
+                                }}
+                                className="relative rounded-full border border-white/10 bg-black/40 text-white backdrop-blur transition-all duration-200 hover:scale-105 hover:bg-white/10 active:scale-95"
+                            >
+                                <MessageSquare className="size-5" />
+                                {unreadCount > 0 && (
+                                    <span className="absolute -top-1 -right-1 flex size-5 items-center justify-center rounded-full bg-white text-[10px] font-bold text-black">
+                                        {unreadCount}
+                                    </span>
+                                )}
+                            </Button>
+                        </div>
+                    </div>
+                )}
+            </div>
+
+            {(sessionStarted || connecting || awaitingSpeech) && chatOpen && (
+                <aside className="animate-panel-in flex h-[45vh] w-full shrink-0 flex-col overflow-hidden border-t border-white/10 bg-[#0B0B0D]/95 shadow-2xl backdrop-blur sm:h-full sm:w-96 sm:border-t-0 sm:border-l">
+                    <div className="flex items-center justify-between border-b border-white/10 px-5 py-4">
+                        <div className="flex flex-col">
+                            <h2 className="text-sm font-semibold">
+                                Transcript
+                            </h2>
+                            <span className="font-mono text-[10px] tracking-widest text-[#71717A] uppercase">
+                                {connecting
+                                    ? 'Connecting to Sage…'
+                                    : awaitingSpeech
+                                      ? 'Sage is about to speak…'
+                                      : speaking
+                                        ? 'Sage is speaking — talk over it to interrupt'
+                                        : generating
+                                          ? 'Generating reply…'
+                                          : connected
+                                            ? 'Listening — turn-taking is automatic'
+                                            : useFallbackLoop
+                                              ? 'Turn-based voice — speak or type to reply'
+                                              : 'Idle'}
+                            </span>
+                        </div>
+                        <Button
+                            variant="ghost"
+                            size="icon"
+                            aria-label="Close chat"
+                            onClick={() => {
+                                setChatOpen(false);
+                                setUnreadCount(0);
+                            }}
+                            className="rounded-[14px] text-[#A1A1AA] transition-all duration-200 hover:scale-105 hover:bg-white/10 hover:text-white active:scale-95"
+                        >
+                            <X className="size-5" />
+                        </Button>
+                    </div>
+
+                    <div
+                        ref={chatRef}
+                        className="flex flex-1 flex-col gap-2 overflow-y-auto px-5 py-4"
+                    >
+                        {chat.length === 0 && !assistantLive && !userLive && (
+                            <p className="text-sm text-[#71717A]">
+                                The conversation appears here, word by word as
+                                it is spoken.
+                            </p>
+                        )}
+                        {chat.map((msg, i) => (
+                            <div
+                                key={i}
+                                className={
+                                    msg.role === 'user'
+                                        ? 'max-w-[85%] self-end rounded-[14px] bg-white px-3 py-2 text-sm text-black'
+                                        : 'max-w-[85%] self-start rounded-[14px] border border-white/10 bg-white/5 px-3 py-2 text-sm text-white'
+                                }
+                            >
+                                {msg.content}
+                            </div>
+                        ))}
+                        {userLive && (
+                            <div className="max-w-[85%] self-end rounded-[14px] border border-white/20 bg-white/10 px-3 py-2 text-sm text-white italic">
+                                {userLive}
+                            </div>
+                        )}
+                        {speaking && (
+                            <div className="flex items-center gap-1 self-start px-2 py-1">
+                                <span className="size-2 animate-bounce rounded-full bg-white/60" />
+                                <span className="animate-bounce-1 size-2 rounded-full bg-white/60" />
+                                <span className="animate-bounce-2 size-2 rounded-full bg-white/60" />
+                            </div>
+                        )}
+                        {assistantLive && (
+                            <div className="max-w-[85%] self-start rounded-[14px] border border-white/10 bg-white/5 px-3 py-2 text-sm text-white">
+                                {assistantLive}
+                            </div>
                         )}
                     </div>
+
+                    <form
+                        onSubmit={(e: React.FormEvent<HTMLFormElement>) => {
+                            e.preventDefault();
+                            void send(message);
+                            setMessage('');
+                        }}
+                        className="flex gap-2 border-t border-white/10 p-4"
+                    >
+                        <textarea
+                            value={message}
+                            onChange={(
+                                e: React.ChangeEvent<HTMLTextAreaElement>,
+                            ) => setMessage(e.target.value)}
+                            onKeyDown={(
+                                e: React.KeyboardEvent<HTMLTextAreaElement>,
+                            ) => {
+                                if (e.key === 'Enter' && !e.shiftKey) {
+                                    e.preventDefault();
+                                    void send(message);
+                                    setMessage('');
+                                }
+                            }}
+                            placeholder="Type here — replies stream the same way…"
+                            disabled={streaming}
+                            className="flex-1 resize-none rounded-[14px] border border-white/10 bg-white/5 px-3 py-2 text-sm text-white shadow-none outline-none placeholder:text-[#71717A] focus-visible:border-white/30 focus-visible:ring-[3px] focus-visible:ring-white/20 disabled:cursor-not-allowed disabled:opacity-50"
+                            rows={2}
+                        />
+                        <Button
+                            type="submit"
+                            size="icon"
+                            className="self-end rounded-[14px] bg-white text-black transition-all duration-200 hover:scale-105 hover:bg-[#CBD5E1] active:scale-95 disabled:hover:scale-100"
+                            disabled={streaming || !message.trim()}
+                            aria-label="Send message"
+                        >
+                            <SendHorizontal className="size-4" />
+                        </Button>
+                    </form>
                 </aside>
             )}
         </div>

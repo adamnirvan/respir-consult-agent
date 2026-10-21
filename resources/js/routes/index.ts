@@ -219,7 +219,7 @@ register.form = registerForm
 
 /**
 * @see \App\Http\Controllers\Consult\ConsultationController::consult
-* @see app/Http/Controllers/Consult/ConsultationController.php:47
+* @see app/Http/Controllers/Consult/ConsultationController.php:57
 * @route '/consult'
 */
 export const consult = (options?: RouteQueryOptions): RouteDefinition<'get'> => ({
@@ -234,7 +234,7 @@ consult.definition = {
 
 /**
 * @see \App\Http\Controllers\Consult\ConsultationController::consult
-* @see app/Http/Controllers/Consult/ConsultationController.php:47
+* @see app/Http/Controllers/Consult/ConsultationController.php:57
 * @route '/consult'
 */
 consult.url = (options?: RouteQueryOptions) => {
@@ -243,7 +243,7 @@ consult.url = (options?: RouteQueryOptions) => {
 
 /**
 * @see \App\Http\Controllers\Consult\ConsultationController::consult
-* @see app/Http/Controllers/Consult/ConsultationController.php:47
+* @see app/Http/Controllers/Consult/ConsultationController.php:57
 * @route '/consult'
 */
 consult.get = (options?: RouteQueryOptions): RouteDefinition<'get'> => ({
@@ -253,7 +253,7 @@ consult.get = (options?: RouteQueryOptions): RouteDefinition<'get'> => ({
 
 /**
 * @see \App\Http\Controllers\Consult\ConsultationController::consult
-* @see app/Http/Controllers/Consult/ConsultationController.php:47
+* @see app/Http/Controllers/Consult/ConsultationController.php:57
 * @route '/consult'
 */
 consult.head = (options?: RouteQueryOptions): RouteDefinition<'head'> => ({
@@ -263,7 +263,7 @@ consult.head = (options?: RouteQueryOptions): RouteDefinition<'head'> => ({
 
 /**
 * @see \App\Http\Controllers\Consult\ConsultationController::consult
-* @see app/Http/Controllers/Consult/ConsultationController.php:47
+* @see app/Http/Controllers/Consult/ConsultationController.php:57
 * @route '/consult'
 */
 const consultForm = (options?: RouteQueryOptions): RouteFormDefinition<'get'> => ({
@@ -273,7 +273,7 @@ const consultForm = (options?: RouteQueryOptions): RouteFormDefinition<'get'> =>
 
 /**
 * @see \App\Http\Controllers\Consult\ConsultationController::consult
-* @see app/Http/Controllers/Consult/ConsultationController.php:47
+* @see app/Http/Controllers/Consult/ConsultationController.php:57
 * @route '/consult'
 */
 consultForm.get = (options?: RouteQueryOptions): RouteFormDefinition<'get'> => ({
@@ -283,7 +283,7 @@ consultForm.get = (options?: RouteQueryOptions): RouteFormDefinition<'get'> => (
 
 /**
 * @see \App\Http\Controllers\Consult\ConsultationController::consult
-* @see app/Http/Controllers/Consult/ConsultationController.php:47
+* @see app/Http/Controllers/Consult/ConsultationController.php:57
 * @route '/consult'
 */
 consultForm.head = (options?: RouteQueryOptions): RouteFormDefinition<'get'> => ({
@@ -380,8 +380,89 @@ homeForm.head = (options?: RouteQueryOptions): RouteFormDefinition<'get'> => ({
 home.form = homeForm
 
 /**
+* @see \Inertia\Controller::__invoke
+* @see vendor/inertiajs/inertia-laravel/src/Controller.php:13
+* @route '/privacy'
+*/
+export const privacy = (options?: RouteQueryOptions): RouteDefinition<'get'> => ({
+    url: privacy.url(options),
+    method: 'get',
+})
+
+privacy.definition = {
+    methods: ["get","head"],
+    url: '/privacy',
+} satisfies RouteDefinition<["get","head"]>
+
+/**
+* @see \Inertia\Controller::__invoke
+* @see vendor/inertiajs/inertia-laravel/src/Controller.php:13
+* @route '/privacy'
+*/
+privacy.url = (options?: RouteQueryOptions) => {
+    return privacy.definition.url + queryParams(options)
+}
+
+/**
+* @see \Inertia\Controller::__invoke
+* @see vendor/inertiajs/inertia-laravel/src/Controller.php:13
+* @route '/privacy'
+*/
+privacy.get = (options?: RouteQueryOptions): RouteDefinition<'get'> => ({
+    url: privacy.url(options),
+    method: 'get',
+})
+
+/**
+* @see \Inertia\Controller::__invoke
+* @see vendor/inertiajs/inertia-laravel/src/Controller.php:13
+* @route '/privacy'
+*/
+privacy.head = (options?: RouteQueryOptions): RouteDefinition<'head'> => ({
+    url: privacy.url(options),
+    method: 'head',
+})
+
+/**
+* @see \Inertia\Controller::__invoke
+* @see vendor/inertiajs/inertia-laravel/src/Controller.php:13
+* @route '/privacy'
+*/
+const privacyForm = (options?: RouteQueryOptions): RouteFormDefinition<'get'> => ({
+    action: privacy.url(options),
+    method: 'get',
+})
+
+/**
+* @see \Inertia\Controller::__invoke
+* @see vendor/inertiajs/inertia-laravel/src/Controller.php:13
+* @route '/privacy'
+*/
+privacyForm.get = (options?: RouteQueryOptions): RouteFormDefinition<'get'> => ({
+    action: privacy.url(options),
+    method: 'get',
+})
+
+/**
+* @see \Inertia\Controller::__invoke
+* @see vendor/inertiajs/inertia-laravel/src/Controller.php:13
+* @route '/privacy'
+*/
+privacyForm.head = (options?: RouteQueryOptions): RouteFormDefinition<'get'> => ({
+    action: privacy.url({
+        [options?.mergeQuery ? 'mergeQuery' : 'query']: {
+            _method: 'HEAD',
+            ...(options?.query ?? options?.mergeQuery ?? {}),
+        }
+    }),
+    method: 'get',
+})
+
+privacy.form = privacyForm
+
+/**
 * @see \App\Http\Controllers\DashboardController::__invoke
-* @see app/Http/Controllers/DashboardController.php:13
+* @see app/Http/Controllers/DashboardController.php:14
 * @route '/dashboard'
 */
 export const dashboard = (options?: RouteQueryOptions): RouteDefinition<'get'> => ({
@@ -396,7 +477,7 @@ dashboard.definition = {
 
 /**
 * @see \App\Http\Controllers\DashboardController::__invoke
-* @see app/Http/Controllers/DashboardController.php:13
+* @see app/Http/Controllers/DashboardController.php:14
 * @route '/dashboard'
 */
 dashboard.url = (options?: RouteQueryOptions) => {
@@ -405,7 +486,7 @@ dashboard.url = (options?: RouteQueryOptions) => {
 
 /**
 * @see \App\Http\Controllers\DashboardController::__invoke
-* @see app/Http/Controllers/DashboardController.php:13
+* @see app/Http/Controllers/DashboardController.php:14
 * @route '/dashboard'
 */
 dashboard.get = (options?: RouteQueryOptions): RouteDefinition<'get'> => ({
@@ -415,7 +496,7 @@ dashboard.get = (options?: RouteQueryOptions): RouteDefinition<'get'> => ({
 
 /**
 * @see \App\Http\Controllers\DashboardController::__invoke
-* @see app/Http/Controllers/DashboardController.php:13
+* @see app/Http/Controllers/DashboardController.php:14
 * @route '/dashboard'
 */
 dashboard.head = (options?: RouteQueryOptions): RouteDefinition<'head'> => ({
@@ -425,7 +506,7 @@ dashboard.head = (options?: RouteQueryOptions): RouteDefinition<'head'> => ({
 
 /**
 * @see \App\Http\Controllers\DashboardController::__invoke
-* @see app/Http/Controllers/DashboardController.php:13
+* @see app/Http/Controllers/DashboardController.php:14
 * @route '/dashboard'
 */
 const dashboardForm = (options?: RouteQueryOptions): RouteFormDefinition<'get'> => ({
@@ -435,7 +516,7 @@ const dashboardForm = (options?: RouteQueryOptions): RouteFormDefinition<'get'> 
 
 /**
 * @see \App\Http\Controllers\DashboardController::__invoke
-* @see app/Http/Controllers/DashboardController.php:13
+* @see app/Http/Controllers/DashboardController.php:14
 * @route '/dashboard'
 */
 dashboardForm.get = (options?: RouteQueryOptions): RouteFormDefinition<'get'> => ({
@@ -445,7 +526,7 @@ dashboardForm.get = (options?: RouteQueryOptions): RouteFormDefinition<'get'> =>
 
 /**
 * @see \App\Http\Controllers\DashboardController::__invoke
-* @see app/Http/Controllers/DashboardController.php:13
+* @see app/Http/Controllers/DashboardController.php:14
 * @route '/dashboard'
 */
 dashboardForm.head = (options?: RouteQueryOptions): RouteFormDefinition<'get'> => ({

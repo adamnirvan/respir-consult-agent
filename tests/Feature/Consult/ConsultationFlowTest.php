@@ -1,6 +1,8 @@
 <?php
 
 use App\Ai\Agents\ConsultAgent;
+use App\Domain\Consult\DTOs\CoughAnalysisResult;
+use App\Domain\Consult\Events\CoughAnalysisCompleted;
 use App\Domain\Consult\Jobs\AnalyseCough;
 use App\Models\Consultation;
 use App\Models\User;
@@ -8,6 +10,7 @@ use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Queue;
 use Laravel\Ai\Audio;
+use Laravel\Ai\Responses\Data\ToolCall;
 use Laravel\Ai\Transcription;
 
 test('guests are redirected to the login page', function () {
@@ -36,12 +39,47 @@ test('first visit creates a consultation and shows the consult page', function (
 
 test('subsequent visits reuse the in-progress consultation', function () {
     $user = User::factory()->create();
-    $consultation = Consultation::factory()->for($user)->create();
+    $consultation = Consultation::factory()->for($user)->create([
+        'status' => 'chatting',
+        'cough_analysis' => null,
+    ]);
     $this->actingAs($user);
 
     $this->get(route('consult'))->assertOk();
 
     expect($user->consultations()->count())->toBe(1);
+});
+
+test('a finished visit is closed and a fresh one starts', function () {
+    $user = User::factory()->create();
+    $this->actingAs($user);
+
+    $finished = Consultation::factory()->for($user)->create([
+        'status' => 'chatting',
+        'cough_analysis' => ['risk_level' => 'low'],
+    ]);
+
+    $this->get(route('consult'))->assertOk();
+
+    expect($user->consultations()->count())->toBe(2);
+    expect($finished->refresh()->status)->toBe('completed');
+    expect($user->consultations()->where('status', 'chatting')->count())->toBe(1);
+});
+
+test('a reviewed visit is closed and a fresh one starts', function () {
+    $user = User::factory()->create();
+    $this->actingAs($user);
+
+    $reviewed = Consultation::factory()->for($user)->create([
+        'status' => 'chatting',
+        'cough_analysis' => null,
+        'is_reviewed' => true,
+    ]);
+
+    $this->get(route('consult'))->assertOk();
+
+    expect($user->consultations()->count())->toBe(2);
+    expect($reviewed->refresh()->status)->toBe('completed');
 });
 
 test('chat is denied when the user does not own the consultation', function () {
@@ -69,6 +107,28 @@ test('chat streams agent deltas and prompts the agent for real calls', function 
     $response->assertOk();
 
     ConsultAgent::assertPrompted('hi');
+});
+
+test('chat emits a tool event when the agent calls start_cough_capture', function () {
+    ConsultAgent::fake([
+        new ToolCall(id: 'call_1', name: 'start_cough_capture', arguments: []),
+        'Please cough toward the microphone twice.',
+    ]);
+    $user = User::factory()->create();
+    $consultation = Consultation::factory()->for($user)->create();
+    $this->actingAs($user);
+
+    $response = $this->post(
+        route('consult.chat', $consultation),
+        ['message' => 'ready'],
+        ['HTTP_ACCEPT' => 'text/event-stream'],
+    );
+
+    $response->assertOk();
+
+    expect($response->streamedContent())
+        ->toContain('"type":"tool"')
+        ->toContain('"name":"start_cough_capture"');
 });
 
 test('chat validates the message', function () {
@@ -257,8 +317,11 @@ test('voice turn transcribes, replies and returns agent speech', function () {
     expect(base64_decode((string) $response->json('audio'), true))->toBe('fake-wav-bytes');
 });
 
-test('voice turn flags the cough request when the agent asks for a sample', function () {
-    ConsultAgent::fake(["I'm ready to record. Please cough toward the microphone twice."]);
+test('voice turn flags the cough request when the agent calls the tool', function () {
+    ConsultAgent::fake([
+        new ToolCall(id: 'call_1', name: 'start_cough_capture', arguments: []),
+        'Please cough toward the microphone twice.',
+    ]);
     Audio::fake(['fake-wav-bytes']);
 
     $user = User::factory()->create();
@@ -304,4 +367,20 @@ test('cough analysis is blocked without recorded consent', function () {
     expect($consultation->captures()->count())->toBe(0);
 
     Queue::assertNothingPushed();
+});
+
+test('cough completion broadcasts the wire event name the frontend subscribes to', function () {
+    $user = User::factory()->create();
+    $consultation = Consultation::factory()->for($user)->create();
+
+    $event = new CoughAnalysisCompleted($consultation, CoughAnalysisResult::unanalysed([]));
+
+    // The frontend subscribes with a leading dot ('.cough.analysis'), which
+    // tells Echo to use this name verbatim. If broadcastAs() ever drifts,
+    // the consult page goes back to looping "analysing" forever.
+    expect($event->broadcastAs())->toBe('cough.analysis');
+
+    $channels = collect($event->broadcastOn())->map(fn ($channel): string => $channel->name);
+
+    expect($channels->contains(fn (string $name): bool => str_contains($name, "consultation.{$consultation->id}")))->toBeTrue();
 });

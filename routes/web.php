@@ -3,11 +3,18 @@
 use App\Http\Controllers\Consult\ConsultationController;
 use App\Http\Controllers\DashboardController;
 use App\Http\Controllers\Doctor\ConsultationReviewController;
+use App\Http\Controllers\OnboardingController;
 use App\Http\Middleware\EnsureDoctor;
 use App\Http\Middleware\EnsurePatient;
+use App\Http\Middleware\EnsureProfileCompleted;
 use Illuminate\Support\Facades\Route;
 
-Route::middleware(['auth', 'verified', EnsurePatient::class])->group(function () {
+Route::middleware(['auth', 'verified'])->group(function () {
+    Route::get('onboarding/profile', [OnboardingController::class, 'edit'])->name('onboarding.profile.edit');
+    Route::post('onboarding/profile', [OnboardingController::class, 'update'])->name('onboarding.profile.update');
+});
+
+Route::middleware(['auth', 'verified', EnsurePatient::class, EnsureProfileCompleted::class])->group(function () {
     Route::get('consult', [ConsultationController::class, 'index'])->name('consult');
     Route::post('consult', [ConsultationController::class, 'store'])->name('consult.store');
     Route::post('consult/{consultation}/consent', [ConsultationController::class, 'consent'])->name('consult.consent');
@@ -19,7 +26,7 @@ Route::middleware(['auth', 'verified', EnsurePatient::class])->group(function ()
         ->name('consult.voice');
     Route::get('consult/{consultation}/live/token', [ConsultationController::class, 'liveToken'])->name('consult.live.token');
     Route::get('consult/{consultation}/context', [ConsultationController::class, 'conversationContext'])
-        ->middleware('throttle:consult-chat')
+        ->middleware('throttle:consult-context')
         ->name('consult.context');
     Route::post('consult/{consultation}/sessions', [ConsultationController::class, 'sessionLog'])->name('consult.sessions.log');
     Route::post('consult/{consultation}/cough', [ConsultationController::class, 'cough'])
@@ -42,11 +49,18 @@ Route::middleware(['auth', 'verified', EnsureDoctor::class])->group(function () 
         ->name('doctor.consultations.briefing');
     Route::get('doctor/consultations/{consultation}/similar', [ConsultationReviewController::class, 'similar'])
         ->name('doctor.consultations.similar');
+    Route::post('doctor/consultations/{consultation}/notes', [ConsultationReviewController::class, 'saveNotes'])
+        ->name('doctor.consultations.notes');
+    Route::post('doctor/consultations/{consultation}/review', [ConsultationReviewController::class, 'markReviewed'])
+        ->name('doctor.consultations.review');
+    Route::get('doctor/consultations/{consultation}/export', [ConsultationReviewController::class, 'exportPdf'])
+        ->name('doctor.consultations.export');
 });
 
 Route::inertia('/', 'welcome')->name('home');
+Route::inertia('privacy', 'legal/privacy')->name('privacy');
 
-Route::middleware(['auth', 'verified'])->group(function () {
+Route::middleware(['auth', 'verified', EnsureProfileCompleted::class])->group(function () {
     Route::get('dashboard', DashboardController::class)->name('dashboard');
 });
 
